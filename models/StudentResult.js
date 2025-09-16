@@ -1,7 +1,11 @@
 const mongoose = require('mongoose');
 const Schema = mongoose.Schema;
 
-const SubjectSchema = new Schema({ name: String, max: Number, obtained: Number });
+const SubjectSchema = new Schema({ 
+  name: String, 
+  max: Number, 
+  obtained: { type: Schema.Types.Mixed }   // Ab number bhi chalega, "Absent" bhi
+});
 
 const StudentResultSchema = new Schema({
   class: { type: String, index: true },
@@ -19,4 +23,5 @@ const StudentResultSchema = new Schema({
   uploadedBy: String,
   uploadedAt: { type: Date, default: Date.now }
 });
+
 module.exports = mongoose.model('StudentResult', StudentResultSchema);

@@ -8,13 +8,60 @@ const StudentResult = require('../models/StudentResult');
 
 const upload = multer({ dest: 'uploads/' });
 
+// normalize helper
 function normalize(s){
-  return String(s || '')
-    .replace(/\s+/g,' ')
-    .trim()
-    .toLowerCase();
+  return String(s || '').replace(/\s+/g,' ').trim().toLowerCase();
 }
 
+// normalize class helper
+function normalizeClass(val) {
+  if (!val) return '';
+
+  const str = String(val).trim().toLowerCase();
+
+  // check numbers directly
+  if (/^\d+$/.test(str)) return str; // "9" → "9"
+
+  // remove common suffixes (9th → 9)
+  if (/^\d+(st|nd|rd|th)$/.test(str)) {
+    return str.replace(/(st|nd|rd|th)$/,'');
+  }
+
+  // "class 9" → 9
+  if (/^class\s*\d+$/.test(str)) {
+    return str.replace(/class\s*/,'');
+  }
+
+  // words → numbers
+  const wordsToNumbers = {
+    'one': 1, 'two': 2, 'three': 3, 'four': 4, 'five': 5,
+    'six': 6, 'seven': 7, 'eight': 8, 'nine': 9, 'ten': 10,
+    'eleven': 11, 'twelve': 12
+  };
+  if (wordsToNumbers[str]) return String(wordsToNumbers[str]);
+
+  return str; // fallback
+}
+
+// non-subject columns list
+const NON_SUBJECT_COLUMNS = [
+  "class", "student", "student name", "name",
+  "roll", "roll no", "roll number",
+  "father", "father name", "f name", "fname", "fathername",
+  "mother", "mother name", "m name", "mname", "mothername",
+  "guardian", "guardian name",
+  "total", "grand total", "overall total", 
+  "marks", "total marks", "grand total marks",
+  "obtained", "obtained marks", "marks obtained",
+  "overall obtained", "grand obtained", "overall marks",
+  "percentage", "grade", "status", "result"
+];
+
+function isNonSubject(header){
+  return NON_SUBJECT_COLUMNS.includes(normalize(header));
+}
+
+// auth middleware
 function auth(req, res, next){
   const h = req.headers.authorization;
   if(!h) return res.status(401).json({ ok:false });
@@ -26,11 +73,10 @@ function auth(req, res, next){
   catch(e){ return res.status(401).json({ ok:false }); }
 }
 
-// find subject name from a header
+// clean subject name
 function extractSubjectName(header){
-  return header
-    .replace(/ (Max|Obt|Total|Obtained)$/i, '') // remove known suffix
-    .trim();
+  // e.g. "English Max", "English Obtained" → "English"
+  return header.replace(/ (Max|Obt|Obtained|Total|Marks)$/i, '').trim();
 }
 
 router.post('/upload', auth, upload.single('csv'), async (req, res)=>{
@@ -48,45 +94,76 @@ router.post('/upload', auth, upload.single('csv'), async (req, res)=>{
         const docs = [];
 
         for(const row of rows){
-          const classVal = row[headers[0]] || '';
+          const classVal = normalizeClass(row[headers[0]]) || '';
           const nameVal = row[headers[1]] || '';
           const fatherVal = row[headers[2]] || '';
           const subjects = [];
           let totMax = 0, totObtained = 0;
 
-          // process pairs dynamically
+          let failCount = 0;
+          let hasAbsent = false;
+
           for(let i = 3; i < headers.length; i += 2){
             const h1 = headers[i];
             const h2 = headers[i+1];
-            if(!h2) break; // odd column at end
+            if(!h2) break;
+
+            // skip non-subject columns
+            if(isNonSubject(h1) || isNonSubject(h2)) continue;
 
             const maxRaw = row[h1];
             const obtRaw = row[h2];
 
-            if((maxRaw === undefined || maxRaw === '') && (obtRaw === undefined || obtRaw === '')) continue;
+            // case1: both max & obtained blank → skip
+            if ((maxRaw === undefined || maxRaw === '') && (obtRaw === undefined || obtRaw === '')) continue;
+
+            // case2: max given but obtained blank → skip
+            if ((maxRaw && maxRaw.trim() !== '') && (!obtRaw || obtRaw.trim() === '')) continue;
 
             const maxVal = parseInt(maxRaw) || 0;
-            const obtained = parseInt(obtRaw) || 0;
+            let obtained;
+            let subjectStatus = 'Pass';
 
-            const subjectName = extractSubjectName(h1);
+            // check for absent
+            if(!obtRaw || /^a(b|bs|bsent)?$/i.test(obtRaw.trim())){
+              obtained = 'Absent';        
+              subjectStatus = 'Absent';
+              hasAbsent = true;
+            } else {
+              obtained = parseInt(obtRaw) || 0;
+              if(obtained === 0 || obtained < (maxVal * 0.33)) {
+                subjectStatus = 'Fail';
+                failCount++;
+              }
+              totObtained += obtained;   // only add numeric marks
+            }
 
             subjects.push({
-              name: subjectName,
+              name: extractSubjectName(h1),
               max: maxVal,
-              obtained
+              obtained,
+              status: subjectStatus
             });
 
             totMax += maxVal;
-            totObtained += obtained;
           }
 
-          // calculate percentage safely
+          // percentage
           let percentage = totMax ? (totObtained / totMax) * 100 : 0;
-          if(percentage > 100) percentage = 100; 
-          percentage = Math.round(percentage * 100) / 100; 
+          percentage = Math.min(percentage, 100);
+          percentage = Math.round(percentage * 100) / 100;
 
-          // pass/fail logic
-          const status = percentage >= 33 ? 'Pass' : 'Fail';
+          // overall status
+          let status = 'Fail';
+          if(hasAbsent){
+            status = 'Absent';
+          } else if(failCount >= 3 || percentage < 33){
+            status = 'Fail';
+          } else if(failCount === 1 || failCount === 2){
+            status = 'Fail Supply';
+          } else {
+            status = 'Pass';
+          }
 
           // grade mapping
           let grade = 'F';
@@ -139,10 +216,9 @@ router.post('/clean', auth, async (req,res)=>{
   res.json({ ok:true });
 });
 
-// Get DB status (number of records)
 router.get('/status', auth, async (req, res) => {
   try {
-    const count = await StudentResult.countDocuments(); // Count all student results
+    const count = await StudentResult.countDocuments();
     res.json({ ok: true, count });
   } catch (err) {
     console.error(err);
